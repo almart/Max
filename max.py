@@ -1492,7 +1492,7 @@ def pet_max():
         "Max is a good boy",
         "Woof!",
         "Bark!",
-        "Bloodhound is great!",
+        "Bloodhound (Legacy) is great!",
         "Black Lives Matter!",
         "Wear a mask!",
         "Hack the planet!",
