@@ -31,6 +31,15 @@ Ideally there shouldn't be much to install, but I've included a requirements.txt
 
 `pip3 install -r requirements.txt`
 
+### Backend Selection and Credentials
+
+Max currently targets BloodHound Legacy (Neo4j). A preview flag has been added to begin wiring support for BloodHound Community Edition (BHCE):
+
+- Use legacy (default): add no flag or `--backend neo4j`
+- Select BHCE preview: `--backend bhce` plus `--bhce-url` and `--bhce-token` as needed
+
+Note: On this branch, most modules still require Neo4j/Cypher. Running them with `--backend bhce` will print a friendly message until CE support is implemented.
+
 ### Neo4j Creds
 
 Neo4j credentials can be hardcoded at the beginning of the script, they can be provided as CLI arguments, or stored as environment variables. If either parameter  is left blank, you will be prompted for the uname/password. To use environment variables, it is probably easiest to add a line (e.g., `export NEO4J_USERNAME='neo4j'`) within *~/.bashrc* or *~/.zshrc*  to store the username since it isn't really sensitive. The database password can be set within your shell's tab prior to running Max. Adding a space before the export command should prevent it from appearing within history.
@@ -41,6 +50,13 @@ python3 max.py {module} {args}
 
 ```
 
+```
+
+For BHCE (preview), you can also set:
+
+```bash
+export BHCE_URL='http://127.0.0.1:8080'
+export BHCE_TOKEN='your_api_token'
 ```
 python3 max.py -u neo4j -p neo4j {module} {args}
 ```

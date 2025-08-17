@@ -19,48 +19,71 @@ except ImportError:
     import cgi as htmllib
 from itertools import zip_longest
 
+# Backend types
+BACKEND_NEO4J = "neo4j"
+BACKEND_BHCE = "bhce"
+
 
 # option to hardcode URL & URI or put them in environment variables, these will be used for neo4j database "default" location
 global_url = "http://127.0.0.1:7474" if (not os.environ.get('NEO4J_URL', False)) else os.environ['NEO4J_URL']
 global_uri = "/db/neo4j/tx/commit" if (not os.environ.get('NEO4J_URI', False)) else os.environ['NEO4J_URI']
+
+# BHCE defaults (preview): base URL and API token can be provided via env
+bhce_url_default = os.environ.get('BHCE_URL', 'http://127.0.0.1:8080')
+bhce_token_default = os.environ.get('BHCE_TOKEN', '')
 
 # option to hardcode creds or put them in environment variables, these will be used as the username and password "defaults"
 global_username = 'neo4j' if (not os.environ.get('NEO4J_USERNAME', False)) else os.environ['NEO4J_USERNAME']
 global_password = 'bloodhound' if (not os.environ.get('NEO4J_PASSWORD', False)) else os.environ['NEO4J_PASSWORD'] 
 
 def do_test(args):
-
-    try:
-        requests.get(args.url + global_uri)
-        return True
-    except:
-        return False
+    """Light connectivity check for the selected backend."""
+    if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
+        try:
+            requests.get(args.url + global_uri)
+            return True
+        except Exception:
+            return False
+    else:
+        # BHCE: Try hitting the base URL; specific health endpoint varies by deployment.
+        try:
+            r = requests.get(args.bhce_url, timeout=5)
+            return r.status_code < 500
+        except Exception:
+            return False
 
 
 def do_query(args, query, data_format=None):
+    """Execute a query against the selected backend.
 
-    data_format = [data_format, "row"][data_format == None]
-    data = {
-        "statements" : [
-            {
-                "statement" : query,
-                "resultDataContents" : [ data_format ]
-            }
-        ]
-    }
-    headers = {'Content-type': 'application/json', 'Accept': 'application/json; charset=UTF-8'}
-    auth = HTTPBasicAuth(args.username, args.password)
+    For legacy BloodHound (Neo4j), this sends a Cypher query via REST.
+    For BloodHound CE, raw Cypher is not supported; this will raise until mapped.
+    """
+    if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
+        data_format = [data_format, "row"][data_format == None]
+        data = {
+            "statements" : [
+                {
+                    "statement" : query,
+                    "resultDataContents" : [ data_format ]
+                }
+            ]
+        }
+        headers = {'Content-type': 'application/json', 'Accept': 'application/json; charset=UTF-8'}
+        auth = HTTPBasicAuth(args.username, args.password)
 
-    r = requests.post(args.url + global_uri, auth=auth, headers=headers, json=data)
+        r = requests.post(args.url + global_uri, auth=auth, headers=headers, json=data)
 
-    if r.status_code == 401:
-        print("Authentication error: the supplied credentials are incorrect for the Neo4j database, specify new credentials with -u & -p or hardcode your credentials at the top of the script")
-        exit()
-    elif r.status_code >= 300:
-        print("Failed to retrieve data. Server returned status code: {}".format(r.status_code))
-        exit()
+        if r.status_code == 401:
+            print("Authentication error: the supplied credentials are incorrect for the Neo4j database, specify new credentials with -u & -p or hardcode your credentials at the top of the script")
+            exit()
+        elif r.status_code >= 300:
+            print("Failed to retrieve data. Server returned status code: {}".format(r.status_code))
+            exit()
+        else:
+            return r
     else:
-        return r
+        raise RuntimeError("This operation requires Neo4j/Cypher and isn’t yet implemented for BloodHound CE.")
 
 
 def get_query_output(entry,delimeter,cols_len=None,path=False):
@@ -1532,10 +1555,15 @@ def main():
 
     general = parser.add_argument_group("Optional Arguments")
 
-    # generic function parameters
+    # backend selection and connection parameters
+    general.add_argument("--backend", dest="backend", choices=[BACKEND_NEO4J, BACKEND_BHCE], default=BACKEND_NEO4J, help="Select backend: 'neo4j' (legacy) or 'bhce' (community edition, preview)")
+    # Neo4j params (legacy)
     general.add_argument("-u",dest="username",default=global_username,help="Neo4j database username (Default: {})".format(global_username))
     general.add_argument("-p",dest="password",default=global_password,help="Neo4j database password (Default: {})".format(global_password))
     general.add_argument("--url",dest="url",default=global_url,help="Neo4j database URL (Default: {})".format(global_url))
+    # BloodHound CE params (preview)
+    general.add_argument("--bhce-url", dest="bhce_url", default=bhce_url_default, help="BloodHound CE base URL (Default: {})".format(bhce_url_default))
+    general.add_argument("--bhce-token", dest="bhce_token", default=bhce_token_default, help="BloodHound CE API token (Default: env BHCE_TOKEN)")
 
     # three options for the function
     parser._positionals.title = "Available Modules"
@@ -1651,17 +1679,29 @@ def main():
 
 
     if not do_test(args):
-        print("Connection error: restart Neo4j console or verify the the following URL is available: {}".format(args.url))
+        if args.backend == BACKEND_NEO4J:
+            print("Connection error: restart Neo4j console or verify the the following URL is available: {}".format(args.url))
+        else:
+            print("Connection error: verify BloodHound CE is reachable at {} (and token if required).".format(args.bhce_url))
         exit()
 
     if args.command == None:
         print("Error: use a module or use -h/--help to see help")
         return
 
-    if args.username == "":
-        args.username = input("Neo4j Username: ")
-    if args.password == "":
-        args.password = getpass.getpass(prompt="Neo4j Password: ")
+    # Prompt for Neo4j creds only when using the legacy backend
+    if args.backend == BACKEND_NEO4J:
+        if args.username == "":
+            args.username = input("Neo4j Username: ")
+        if args.password == "":
+            args.password = getpass.getpass(prompt="Neo4j Password: ")
+
+    # Temporary: gate modules not yet implemented for BHCE
+    unsupported_bhce = {"query", "export", "del-edge", "add-spns", "add-spw", "dpat", "get-info", "mark-owned", "mark-hvt"}
+    if args.backend == BACKEND_BHCE and args.command in unsupported_bhce:
+        print("This module uses Neo4j/Cypher in the current version and isn’t implemented for BloodHound CE yet on this branch.")
+        print("Tip: run with --backend neo4j for legacy, or watch this branch for CE support.")
+        return
 
     if args.command == "get-info":
         get_info(args)
