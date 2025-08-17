@@ -379,7 +379,7 @@ def get_info(args):
         cols = queries["foreignprivs"]["columns"]
     elif (args.ownedtohvts):
         query = queries["owned-to-hvts"]["query"]
-        cols = queries["owned-to-hvts"]["query"]
+        cols = queries["owned-to-hvts"]["columns"]
     elif (args.unamesess != ""):
         query = queries["sessions"]["query"].format(uname=args.unamesess.upper().strip())
         cols = queries["sessions"]["columns"]
@@ -1902,7 +1902,7 @@ def main():
         if args.backend == BACKEND_NEO4J:
             print("Connection error: restart Neo4j console or verify the the following URL is available: {}".format(args.url))
         else:
-            print("Connection error: verify BloodHound CE is reachable at {} (and token if required).".format(args.bhce_url))
+            print("Connection error: verify BloodHound CE is reachable at {} (and credentials if required).".format(args.bhce_url))
         exit()
 
     if args.command == None:
