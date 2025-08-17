@@ -34,7 +34,6 @@ bhce_url_default = os.environ.get('BHCE_URL', 'http://127.0.0.1:8080')
 bhce_user_default = os.environ.get('BHCE_USER', '')
 bhce_secret_default = os.environ.get('BHCE_SECRET', '')
 bhce_otp_default = os.environ.get('BHCE_OTP', '')
-bhce_cookie_default = os.environ.get('BHCE_COOKIE', '')
 bhce_insecure_default = os.environ.get('BHCE_INSECURE', 'false').lower() in ('1','true','yes','y')
 
 # option to hardcode creds or put them in environment variables, these will be used as the username and password "defaults"
@@ -45,22 +44,17 @@ def do_test(args):
     """Light connectivity check for the selected backend."""
     if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
         try:
-            requests.get(args.url + global_uri)
+            requests.get(args.url + global_uri, timeout=5)
             return True
         except Exception:
             return False
     else:
-        # BHCE: Prefer a real auth check when creds or cookies are provided; else probe base URL.
+    # BHCE: Prefer a real auth check when creds are provided; else probe base URL.
         try:
             client = BHCEClient(args.bhce_url, verify=not args.bhce_insecure)
-            if getattr(args, 'bhce_cookie', ''):
-                client.add_cookies_from_header(args.bhce_cookie)
             if getattr(args, 'bhce_user', '') and getattr(args, 'bhce_secret', ''):
                 if client.login(args.bhce_user, args.bhce_secret, args.bhce_otp or None):
                     return True
-            # Try self with cookies-only deployment
-            if client.get_self() is not None:
-                return True
             # Fallback to base URL probe
             r = requests.get(args.bhce_url, timeout=5, verify=not args.bhce_insecure)
             return r.status_code < 500
@@ -69,13 +63,8 @@ def do_test(args):
 
 
 def _build_bhce_client(args) -> BHCEClient:
-    """Create and return a BHCE client with verify/cookies and optional login."""
+    """Create and return a BHCE client with verify and optional login."""
     client = BHCEClient(args.bhce_url, verify=not args.bhce_insecure)
-    if getattr(args, 'bhce_cookie', ''):
-        try:
-            client.add_cookies_from_header(args.bhce_cookie)
-        except Exception:
-            pass
     if args.bhce_user and args.bhce_secret:
         client.login(args.bhce_user, args.bhce_secret, args.bhce_otp or None)
     return client
@@ -245,7 +234,7 @@ def get_info(args):
         },
         "admincomps" : {
             "query" : "MATCH (n:Computer),(m:Computer) MATCH (n)-[r:MemberOf|AdminTo*1..]->(m) RETURN DISTINCT n.name,m.name ORDER BY n.name",
-            "columns" : ["AdminComputerName","VictimCompterName"]
+            "columns" : ["AdminComputerName","VictimComputerName"]
         },
         "nolaps" : {
             "query" : "MATCH (c:Computer {haslaps:false}) RETURN c.name",
@@ -1130,7 +1119,7 @@ def dpat_func(args):
             "label" : "Accounts With Explicit Admin Rights Cracked"
         },
         {
-            "query" : "MATCH p2=(u:User {cracked:true})-[r1:MemberOf*1..]->(g:Group)-[r2:AdmintTo]->(n2) RETURN DISTINCT u.enabled,u.ntds_uname,u.password,u.nt_hash",
+            "query" : "MATCH p2=(u:User {cracked:true})-[r1:MemberOf*1..]->(g:Group)-[r2:AdminTo]->(n2) RETURN DISTINCT u.enabled,u.ntds_uname,u.password,u.nt_hash",
             "label" : "Accounts With Group Delegated Admin Rights Cracked"
         },
         {
@@ -1782,7 +1771,6 @@ def main():
     general.add_argument("--bhce-user", dest="bhce_user", default=bhce_user_default, help="BloodHound CE username (env BHCE_USER)")
     general.add_argument("--bhce-secret", dest="bhce_secret", default=bhce_secret_default, help="BloodHound CE password/secret (env BHCE_SECRET)")
     general.add_argument("--bhce-otp", dest="bhce_otp", default=bhce_otp_default, help="Optional one-time passcode for BHCE login (env BHCE_OTP)")
-    general.add_argument("--bhce-cookie", dest="bhce_cookie", default=bhce_cookie_default, help="Optional raw Cookie header to inject (env BHCE_COOKIE)")
     general.add_argument("--bhce-insecure", dest="bhce_insecure", action="store_true", default=bhce_insecure_default, help="Disable TLS verification for BHCE (env BHCE_INSECURE)")
 
     # three options for the function

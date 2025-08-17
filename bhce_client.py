@@ -42,33 +42,6 @@ class BHCEClient:
             headers.update(extra_headers)
         return self.session.post(url, headers=headers, json=json, timeout=self.timeout, verify=self.verify, allow_redirects=allow_redirects)
 
-    # --- Cookie helpers ---------------------------------------------------
-    def add_cookies_from_header(self, cookie_header: str) -> None:
-        """Add cookies from a raw 'Cookie:' header string.
-
-        Example: 'session=abc; other=value'. Domain is derived from base_url.
-        """
-        if not cookie_header:
-            return
-        header = cookie_header.strip()
-        if header.lower().startswith('cookie:'):
-            header = header.split(':', 1)[1].strip()
-        # Split by ';' then name=value
-        for part in header.split(';'):
-            p = part.strip()
-            if not p or '=' not in p:
-                continue
-            name, value = p.split('=', 1)
-            name = name.strip()
-            value = value.strip()
-            if not name:
-                continue
-            # Use requests to set cookie scoped to base domain
-            try:
-                self.session.cookies.set(name, value, domain=self._domain, path='/')
-            except Exception:
-                # Best-effort; ignore invalid cookie formats
-                pass
 
     # --- Auth/session ------------------------------------------------------
     def login(self, username: str, secret: str, otp: Optional[str] = None) -> bool:
