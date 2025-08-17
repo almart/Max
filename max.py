@@ -18,49 +18,100 @@ try:
 except ImportError:
     import cgi as htmllib
 from itertools import zip_longest
+from bhce_client import BHCEClient
+
+# Backend types
+BACKEND_NEO4J = "neo4j"
+BACKEND_BHCE = "bhce"
 
 
 # option to hardcode URL & URI or put them in environment variables, these will be used for neo4j database "default" location
 global_url = "http://127.0.0.1:7474" if (not os.environ.get('NEO4J_URL', False)) else os.environ['NEO4J_URL']
 global_uri = "/db/neo4j/tx/commit" if (not os.environ.get('NEO4J_URI', False)) else os.environ['NEO4J_URI']
 
+# BHCE defaults (preview)
+bhce_url_default = os.environ.get('BHCE_URL', 'http://127.0.0.1:8080')
+bhce_user_default = os.environ.get('BHCE_USER', '')
+bhce_secret_default = os.environ.get('BHCE_SECRET', '')
+bhce_otp_default = os.environ.get('BHCE_OTP', '')
+bhce_cookie_default = os.environ.get('BHCE_COOKIE', '')
+bhce_insecure_default = os.environ.get('BHCE_INSECURE', 'false').lower() in ('1','true','yes','y')
+
 # option to hardcode creds or put them in environment variables, these will be used as the username and password "defaults"
 global_username = 'neo4j' if (not os.environ.get('NEO4J_USERNAME', False)) else os.environ['NEO4J_USERNAME']
 global_password = 'bloodhound' if (not os.environ.get('NEO4J_PASSWORD', False)) else os.environ['NEO4J_PASSWORD'] 
 
 def do_test(args):
+    """Light connectivity check for the selected backend."""
+    if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
+        try:
+            requests.get(args.url + global_uri)
+            return True
+        except Exception:
+            return False
+    else:
+        # BHCE: Prefer a real auth check when creds or cookies are provided; else probe base URL.
+        try:
+            client = BHCEClient(args.bhce_url, verify=not args.bhce_insecure)
+            if getattr(args, 'bhce_cookie', ''):
+                client.add_cookies_from_header(args.bhce_cookie)
+            if getattr(args, 'bhce_user', '') and getattr(args, 'bhce_secret', ''):
+                if client.login(args.bhce_user, args.bhce_secret, args.bhce_otp or None):
+                    return True
+            # Try self with cookies-only deployment
+            if client.get_self() is not None:
+                return True
+            # Fallback to base URL probe
+            r = requests.get(args.bhce_url, timeout=5, verify=not args.bhce_insecure)
+            return r.status_code < 500
+        except Exception:
+            return False
 
-    try:
-        requests.get(args.url + global_uri)
-        return True
-    except:
-        return False
+
+def _build_bhce_client(args) -> BHCEClient:
+    """Create and return a BHCE client with verify/cookies and optional login."""
+    client = BHCEClient(args.bhce_url, verify=not args.bhce_insecure)
+    if getattr(args, 'bhce_cookie', ''):
+        try:
+            client.add_cookies_from_header(args.bhce_cookie)
+        except Exception:
+            pass
+    if args.bhce_user and args.bhce_secret:
+        client.login(args.bhce_user, args.bhce_secret, args.bhce_otp or None)
+    return client
 
 
 def do_query(args, query, data_format=None):
+    """Execute a query against the selected backend.
 
-    data_format = [data_format, "row"][data_format == None]
-    data = {
-        "statements" : [
-            {
-                "statement" : query,
-                "resultDataContents" : [ data_format ]
-            }
-        ]
-    }
-    headers = {'Content-type': 'application/json', 'Accept': 'application/json; charset=UTF-8'}
-    auth = HTTPBasicAuth(args.username, args.password)
+    For legacy BloodHound (Neo4j), this sends a Cypher query via REST.
+    For BloodHound CE, raw Cypher is not supported; this will raise until mapped.
+    """
+    if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
+        data_format = [data_format, "row"][data_format == None]
+        data = {
+            "statements" : [
+                {
+                    "statement" : query,
+                    "resultDataContents" : [ data_format ]
+                }
+            ]
+        }
+        headers = {'Content-type': 'application/json', 'Accept': 'application/json; charset=UTF-8'}
+        auth = HTTPBasicAuth(args.username, args.password)
 
-    r = requests.post(args.url + global_uri, auth=auth, headers=headers, json=data)
+        r = requests.post(args.url + global_uri, auth=auth, headers=headers, json=data)
 
-    if r.status_code == 401:
-        print("Authentication error: the supplied credentials are incorrect for the Neo4j database, specify new credentials with -u & -p or hardcode your credentials at the top of the script")
-        exit()
-    elif r.status_code >= 300:
-        print("Failed to retrieve data. Server returned status code: {}".format(r.status_code))
-        exit()
+        if r.status_code == 401:
+            print("Authentication error: the supplied credentials are incorrect for the Neo4j database, specify new credentials with -u & -p or hardcode your credentials at the top of the script")
+            exit()
+        elif r.status_code >= 300:
+            print("Failed to retrieve data. Server returned status code: {}".format(r.status_code))
+            exit()
+        else:
+            return r
     else:
-        return r
+        raise RuntimeError("This operation requires Neo4j/Cypher and isn’t yet implemented for BloodHound CE.")
 
 
 def get_query_output(entry,delimeter,cols_len=None,path=False):
@@ -405,68 +456,104 @@ def get_info(args):
 
 def mark_owned(args):
 
-    if (args.clear):
+    if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
+        if (args.clear):
+            query = 'MATCH (n) WHERE n.owned=true SET n.owned=false'
+            r = do_query(args,query)
+            print("[+] 'Owned' attribute removed from all objects.")
+        else:
+            note_string = ""
+            if args.notes != "":
+                note_string = "SET n.notes=\"" + args.notes + "\""
 
-        query = 'MATCH (n) WHERE n.owned=true SET n.owned=false'
-        r = do_query(args,query)
-        print("[+] 'Owned' attribute removed from all objects.")
+            f = open(args.filename).readlines()
 
-    else:
+            for line in f:
 
-        note_string = ""
-        if args.notes != "":
-            note_string = "SET n.notes=\"" + args.notes + "\""
-
-        f = open(args.filename).readlines()
-
-        for line in f:
-
-            if args.userpass is True or args.store:
-                uname, passwd = line.strip().split(':')
-                uname = uname.upper()
-                if args.store:
-                    passwd_query = "SET n.password=\"" + passwd + "\""
+                if args.userpass is True or args.store:
+                    uname, passwd = line.strip().split(':')
+                    uname = uname.upper()
+                    if args.store:
+                        passwd_query = "SET n.password=\"" + passwd + "\""
+                    else:
+                        passwd_query = ""
                 else:
-                    passwd_query = ""
-            else:
-                uname = line.upper().strip()
+                    uname = line.upper().strip()
 
-            query = 'MATCH (n) WHERE n.name="{uname}" SET n.owned=true {notes} {passwd} RETURN n'.format(uname=uname,passwd=passwd_query,notes=note_string)
-            r = do_query(args, query)
+                query = 'MATCH (n) WHERE n.name="{uname}" SET n.owned=true {notes} {passwd} RETURN n'.format(uname=uname,passwd=passwd_query,notes=note_string)
+                r = do_query(args, query)
 
-            fail_resp = '{"results":[{"columns":["n"],"data":[]}],"errors":[]}'
-            if r.text == fail_resp:
-                print("[-] AD Object: " + uname + " could not be marked as owned")
+                fail_resp = '{"results":[{"columns":["n"],"data":[]}],"errors":[]}'
+                if r.text == fail_resp:
+                    print("[-] AD Object: " + uname + " could not be marked as owned")
+                else:
+                    print("[+] AD Object: " + uname + " marked as owned successfully")
+    else:
+        client = _build_bhce_client(args)
+        if args.clear:
+            ok = bool(client.cypher("MATCH (n) WHERE n.owned=true SET n.owned=false RETURN COUNT(n)", include_properties=False))
+            print("[+] 'Owned' attribute removed from all objects." if ok else "[-] Failed to clear 'Owned' attribute")
+            return
+        # Mark inputs as owned; optionally set notes and store password
+        f = open(args.filename).readlines()
+        for line in f:
+            passwd = None
+            if args.userpass or args.store:
+                uname, passwd = line.strip().split(':', 1)
             else:
+                uname = line.strip()
+            uname = uname.upper()
+            props = {"owned": True}
+            if args.notes:
+                props["notes"] = args.notes
+            if args.store and passwd is not None:
+                props["password"] = passwd
+            ok = client.update_node_properties_by_name(uname, props)
+            if ok:
                 print("[+] AD Object: " + uname + " marked as owned successfully")
+            else:
+                print("[-] AD Object: " + uname + " could not be marked as owned")
 
 
 def mark_hvt(args):
+    if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
+        if (args.clear):
+            query = 'MATCH (n) WHERE n.highvalue=true SET n.highvalue=false'
+            r = do_query(args,query)
+            print("[+] 'High Value' attribute removed from all objects.")
+        else:
+            note_string = ""
+            if args.notes != "":
+                note_string = "SET n.notes=\"" + args.notes + "\""
 
-    if (args.clear):
+            f = open(args.filename).readlines()
 
-        query = 'MATCH (n) WHERE n.highvalue=true SET n.highvalue=false'
-        r = do_query(args,query)
-        print("[+] 'High Value' attribute removed from all objects.")
+            for line in f:
+                query = 'MATCH (n) WHERE n.name="{uname}" SET n.highvalue=true {notes} RETURN n'.format(uname=line.upper().strip(),notes=note_string)
+                r = do_query(args, query)
 
+                fail_resp = '{"results":[{"columns":["n"],"data":[]}],"errors":[]}'
+                if r.text == fail_resp:
+                    print("[-] AD Object: " + line.upper().strip() + " could not be marked as HVT")
+                else:
+                    print("[+] AD Object: " + line.upper().strip() + " marked as HVT successfully")
     else:
-
-        note_string = ""
-        if args.notes != "":
-            note_string = "SET n.notes=\"" + args.notes + "\""
-
+        client = _build_bhce_client(args)
+        if args.clear:
+            ok = bool(client.cypher("MATCH (n) WHERE n.highvalue=true SET n.highvalue=false RETURN COUNT(n)", include_properties=False))
+            print("[+] 'High Value' attribute removed from all objects." if ok else "[-] Failed to clear 'High Value' attribute")
+            return
         f = open(args.filename).readlines()
-
         for line in f:
-
-            query = 'MATCH (n) WHERE n.name="{uname}" SET n.highvalue=true {notes} RETURN n'.format(uname=line.upper().strip(),notes=note_string)
-            r = do_query(args, query)
-
-            fail_resp = '{"results":[{"columns":["n"],"data":[]}],"errors":[]}'
-            if r.text == fail_resp:
-                print("[-] AD Object: " + line.upper().strip() + " could not be marked as HVT")
+            name = line.upper().strip()
+            props = {"highvalue": True}
+            if args.notes:
+                props["notes"] = args.notes
+            ok = client.update_node_properties_by_name(name, props)
+            if ok:
+                print("[+] AD Object: " + name + " marked as HVT successfully")
             else:
-                print("[+] AD Object: " + line.upper().strip() + " marked as HVT successfully")
+                print("[-] AD Object: " + name + " could not be marked as HVT")
 
 
 def query_func(args):
@@ -660,17 +747,17 @@ def add_spns(args):
         print("Invalid Option")
 
     count = 0
-    for set in objects:
+    for spn_pair in objects:
 
-        query = statement.format(uname=set[1],comp=set[0])
+        query = statement.format(uname=spn_pair[1],comp=spn_pair[0])
 
         r = do_query(args, query)
 
         fail_resp = '{"results":[{"columns":["n","m"],"data":[]}],"errors":[]}'
         if r.text == fail_resp:
-            print("[-] Relationship " + set[0] + " -- HasSPNConfigured -> " + set[1] + " could not be added")
+            print("[-] Relationship " + spn_pair[0] + " -- HasSPNConfigured -> " + spn_pair[1] + " could not be added")
         else:
-            print("[+] Relationship " + set[0] + " -- HasSPNConfigured -> " + set[1] + " added")
+            print("[+] Relationship " + spn_pair[0] + " -- HasSPNConfigured -> " + spn_pair[1] + " added")
             count = count + 1
 
     print('[+] HasSPNConfigured relationships created: ' + str(count))
@@ -742,6 +829,9 @@ def dpat_parse_ntds(lines, ntds_parsed):
 
 def dpat_map_users(args, users, potfile):
     count = 0
+    bh_client = None
+    if getattr(args, 'backend', BACKEND_NEO4J) != BACKEND_NEO4J:
+        bh_client = _build_bhce_client(args)
     for user in users:
         try:
             nt_hash = user[4]
@@ -768,12 +858,26 @@ def dpat_map_users(args, users, potfile):
             cracked_query = "SET u.cracked={cracked_bool} SET u.nt_hash='{nt_hash}' SET u.lm_hash='{lm_hash}' SET u.ntds_uname='{ntds_uname}' {password}".format(cracked_bool=cracked_bool,nt_hash=nt_hash,lm_hash=lm_hash,ntds_uname=ntds_uname,password=password_query)
             query1 = "MATCH (u:User) WHERE u.name='{username1}' OR (u.name STARTS WITH '{username2}@' AND u.objectid ENDS WITH '-{rid}') {cracked_query} RETURN u.name,u.objectid".format(username1=username, username2=user[0].replace("\\","\\\\").replace("'","\\'").upper(), rid=user[2].upper(), cracked_query=cracked_query)
 
-            r1 = do_query(args,query1)
-            bh_users = json.loads(r1.text)['results'][0]['data']
-
-            # if bh_users == [] then the user was not found in BH
-            if bh_users != []:
-                count = count + 1
+            if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
+                r1 = do_query(args,query1)
+                bh_users = json.loads(r1.text)['results'][0]['data']
+                if bh_users != []:
+                    count = count + 1
+            else:
+                # BHCE path: try to find and update user via REST (reuse a single client)
+                client = bh_client or _build_bhce_client(args)
+                user_node = client.find_user_by_name_or_rid(username, user[2])
+                if user_node:
+                    props = {
+                        "cracked": cracked_bool == 'true',
+                        "nt_hash": nt_hash,
+                        "lm_hash": lm_hash,
+                        "ntds_uname": ntds_uname,
+                    }
+                    if password is not None:
+                        props["password"] = password
+                    if client.update_user_properties(user_node, props):
+                        count = count + 1
 
         except Exception as g:
             print("[-] Mapping ERROR: {} FOR USER {}".format(g, user[0]))
@@ -790,8 +894,14 @@ def dpat_func(args):
 
     if args.clear:
         print("[+] Clearing attributes from all users: cracked, password, nt_hash, lm_hash, ntds_uname")
-        clear_query = "MATCH (u:User) REMOVE u.cracked REMOVE u.nt_hash REMOVE u.lm_hash REMOVE u.ntds_uname REMOVE u.password"
-        do_query(args,clear_query)
+        if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
+            clear_query = "MATCH (u:User) REMOVE u.cracked REMOVE u.nt_hash REMOVE u.lm_hash REMOVE u.ntds_uname REMOVE u.password"
+            do_query(args,clear_query)
+        else:
+            client = _build_bhce_client(args)
+            # Best-effort: iterate users and wipe properties
+            for u in client.list_users():
+                client.update_user_properties(u, {"cracked": None, "password": None, "nt_hash": None, "lm_hash": None, "ntds_uname": None})
         return
 
     if ((args.output) and (not args.csv and not args.html)):
@@ -871,10 +981,14 @@ def dpat_func(args):
                 p_.join()
 
 
-            count_query = "MATCH (u:User) WHERE u.cracked IS NOT NULL RETURN COUNT(u.name)"
-            r = do_query(args,count_query)
-            resp = json.loads(r.text)['results'][0]['data']
-            count = resp[0]['row'][0]
+            if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
+                count_query = "MATCH (u:User) WHERE u.cracked IS NOT NULL RETURN COUNT(u.name)"
+                r = do_query(args,count_query)
+                resp = json.loads(r.text)['results'][0]['data']
+                count = resp[0]['row'][0]
+            else:
+                client = _build_bhce_client(args)
+                count = sum(1 for u in client.list_users() if (u.get('properties') or {}).get('cracked'))
             print("[+] BloodHound data queried successfully, {} NTDS users mapped to BH data".format(count))
             if count < 10:
                 print("[-] Warning: Less than 10 users mapped to BloodHound entries, verify the NTDS data matches the Neo4j data, continuing...")
@@ -891,25 +1005,44 @@ def dpat_func(args):
 
     if args.passwd:
         print("[+] Searching for users with password '{}'".format(args.passwd))
-        query = "MATCH (u:User {{cracked:true}}) WHERE u.password='{pwd}' RETURN u.name".format(pwd=args.passwd.replace("\\","\\\\").replace("'","\\'"))
-        r = do_query(args,query)
-        resp = json.loads(r.text)['results'][0]['data']
-        print("[+] Users: {}\n".format(len(resp)))
-        for entry in resp:
-            print(entry['row'][0])
+        if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
+            query = "MATCH (u:User {{cracked:true}}) WHERE u.password='{pwd}' RETURN u.name".format(pwd=args.passwd.replace("\\","\\\\").replace("'","\\'"))
+            r = do_query(args,query)
+            resp = json.loads(r.text)['results'][0]['data']
+            print("[+] Users: {}\n".format(len(resp)))
+            for entry in resp:
+                print(entry['row'][0])
+        else:
+            client = _build_bhce_client(args)
+            users = [u for u in client.list_users() if (u.get('properties') or {}).get('cracked') and (u.get('properties') or {}).get('password') == args.passwd]
+            print("[+] Users: {}\n".format(len(users)))
+            for u in users:
+                print((u.get('name') or (u.get('properties') or {}).get('name') or ''))
         return
 
     if args.usern:
         print("[+] Searching for password for user {}".format(args.usern))
-        query = "MATCH (u:User) WHERE toUpper(u.name)='{uname}' OR toUpper(u.ntds_uname)='{uname}' RETURN u.name,u.password".format(uname=args.usern.upper().replace("\\","\\\\").replace("'","\\'"))
-        r = do_query(args,query)
-        resp = json.loads(r.text)['results'][0]['data']
-        if resp == []:
-            print("[-] User {uname} not found".format(uname=args.usern))
-        elif resp[0]['row'][1] == None:
-            print("[-] User {uname} not cracked, no password found".format(uname=args.usern))
+        if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
+            query = "MATCH (u:User) WHERE toUpper(u.name)='{uname}' OR toUpper(u.ntds_uname)='{uname}' RETURN u.name,u.password".format(uname=args.usern.upper().replace("\\","\\\\").replace("'","\\'"))
+            r = do_query(args,query)
+            resp = json.loads(r.text)['results'][0]['data']
+            if resp == []:
+                print("[-] User {uname} not found".format(uname=args.usern))
+            elif resp[0]['row'][1] == None:
+                print("[-] User {uname} not cracked, no password found".format(uname=args.usern))
+            else:
+                print("[+] Password for user {uname}: {pwd}".format(uname=args.usern,pwd=dpat_sanitize(args, resp[0]['row'][1])))
         else:
-            print("[+] Password for user {uname}: {pwd}".format(uname=args.usern,pwd=dpat_sanitize(args, resp[0]['row'][1])))
+            client = _build_bhce_client(args)
+            u = client.find_user_by_name_or_rid(args.usern, None)
+            if not u:
+                print("[-] User {uname} not found".format(uname=args.usern))
+            else:
+                pwd = (u.get('properties') or {}).get('password')
+                if not pwd:
+                    print("[-] User {uname} not cracked, no password found".format(uname=args.usern))
+                else:
+                    print("[+] Password for user {uname}: {pwd}".format(uname=args.usern,pwd=dpat_sanitize(args, pwd)))
         return
 
     ###
@@ -1028,75 +1161,83 @@ def dpat_func(args):
     query_output_data = []
 
     hashes = {}
-    query = "MATCH (u:User) WHERE u.nt_hash IS NOT NULL RETURN u.nt_hash,u.ntds_uname"
-    r = do_query(args,query)
-    resp = json.loads(r.text)['results'][0]['data']
-
-    for entry in resp:
-        if entry['row'][0] not in hashes:
-            hashes[entry['row'][0]] = [entry['row'][1]]
-        else:
-            hashes[entry['row'][0]].append(entry['row'][1])
-    import time
-    for search_value in queries:
-
-        # start = time.time()
-
-        query = search_value['query']
-        label = search_value['label']
-        if (label not in query_counts):
-            query_counts[label] = 0
-        print("[+] Querying for \"" + label + "\"")
-        dat = { 'label' : label }
-        dat['enabled'] = []
-        dat['disabled'] = []
-
+    if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
+        query = "MATCH (u:User) WHERE u.nt_hash IS NOT NULL RETURN u.nt_hash,u.ntds_uname"
         r = do_query(args,query)
         resp = json.loads(r.text)['results'][0]['data']
-        # end = time.time()
-        # print("[*] Done in {} seconds".format(end-start))
         for entry in resp:
-            query_counts[label] += 1 # TODO
-            status_flag = "disabled"
-            if entry['row'][0]:
-                status_flag = "enabled"
+            if entry['row'][0] not in hashes:
+                hashes[entry['row'][0]] = [entry['row'][1]]
+            else:
+                hashes[entry['row'][0]].append(entry['row'][1])
+    else:
+        client = _build_bhce_client(args)
+        for u in client.list_users():
+            props = u.get('properties') or {}
+            if props.get('nt_hash'):
+                hashes.setdefault(props['nt_hash'], []).append(props.get('ntds_uname') or props.get('name') or '')
+    import time
+    # Skip Cypher-only query sections when using BHCE (not yet implemented via API)
+    if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_BHCE:
+        print("[*] Skipping BloodHound graph queries for BHCE backend (not implemented via API yet)")
+    else:
+        for search_value in queries:
+            # start = time.time()
+            query = search_value['query']
+            label = search_value['label']
+            if (label not in query_counts):
+                query_counts[label] = 0
+            print("[+] Querying for \"" + label + "\"")
+            dat = { 'label' : label }
+            dat['enabled'] = []
+            dat['disabled'] = []
+
+            r = do_query(args,query)
+            resp = json.loads(r.text)['results'][0]['data']
+            # end = time.time()
+            # print("[*] Done in {} seconds".format(end-start))
+            for entry in resp:
+                query_counts[label] += 1 # TODO
+                status_flag = "disabled"
+                if entry['row'][0]:
+                    status_flag = "enabled"
+
+                if "cracked" in label.lower():
+                    try:
+                        user = [entry['row'][1], entry['row'][2], len(entry['row'][2]), entry['row'][3]]
+                        dat[status_flag].append(user)
+                    except:
+                        pass
+                else:
+                    try:
+                        share_count = len(hashes[entry['row'][2]])
+                        if share_count > 30:
+                            all_hashes_shared = "Shared Hash List > 30"
+                        else:
+                            all_hashes_shared = ', '.join(hashes[entry['row'][2]])
+                        user = [entry['row'][1], entry['row'][2], all_hashes_shared, share_count, entry['row'][3]]
+                        dat[status_flag].append(user)
+                    except:
+                        pass
 
             if "cracked" in label.lower():
-                try:
-                    user = [entry['row'][1], entry['row'][2], len(entry['row'][2]), entry['row'][3]]
-                    dat[status_flag].append(user)
-                except:
-                    pass
+                dat['columns'] = ["Username", "Password", "Password Length", "NT Hash"]
+                dat['enabled'] = sorted(dat['enabled'], key = lambda x: -1 if x[1] is None else len(x[1]), reverse=True)
+                dat['disabled'] = sorted(dat['disabled'], key = lambda x: -1 if x[1] is None else len(x[1]), reverse=True)
+
             else:
-                try:
-                    share_count = len(hashes[entry['row'][2]])
-                    if share_count > 30:
-                        all_hashes_shared = "Shared Hash List > 30"
-                    else:
-                        all_hashes_shared = ', '.join(hashes[entry['row'][2]])
-                    user = [entry['row'][1], entry['row'][2], all_hashes_shared, share_count, entry['row'][3]]
-                    dat[status_flag].append(user)
-                except:
-                    pass
+                dat['columns'] = ["Username", "NT Hash", "Users Sharing this Hash", "Share Count", "Password"]
+                dat['enabled'] = sorted(dat['enabled'], key = lambda x: -1 if x[3] is None else x[3], reverse=True)
+                dat['disabled'] = sorted(dat['disabled'], key = lambda x: -1 if x[3] is None else x[3], reverse=True)
 
-        if "cracked" in label.lower():
-            dat['columns'] = ["Username", "Password", "Password Length", "NT Hash"]
-            dat['enabled'] = sorted(dat['enabled'], key = lambda x: -1 if x[1] is None else len(x[1]), reverse=True)
-            dat['disabled'] = sorted(dat['disabled'], key = lambda x: -1 if x[1] is None else len(x[1]), reverse=True)
-
-        else:
-            dat['columns'] = ["Username", "NT Hash", "Users Sharing this Hash", "Share Count", "Password"]
-            dat['enabled'] = sorted(dat['enabled'], key = lambda x: -1 if x[3] is None else x[3], reverse=True)
-            dat['disabled'] = sorted(dat['disabled'], key = lambda x: -1 if x[3] is None else x[3], reverse=True)
-
-        query_output_data.append(dat)
+            query_output_data.append(dat)
 
     ###
     ### Get the Group Stats ready
     ###
     # TODO: Output group members in html output
 
-    if not args.less:
+    if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J and not args.less:
 
         print("[+] Querying for Group Statistics")
         group_query_data = {}
@@ -1130,33 +1271,49 @@ def dpat_func(args):
     print("[+] Generating Overall Statistics")
 
     # all password hashes
-    query = "MATCH (u:User) WHERE u.cracked IS NOT NULL RETURN u.ntds_uname,u.password,u.nt_hash,u.pwdlastset"
-    r = do_query(args,query)
-    resp = json.loads(r.text)['results'][0]['data']
-    num_pass_hashes = len(resp)
+    if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
+        query = "MATCH (u:User) WHERE u.cracked IS NOT NULL RETURN u.ntds_uname,u.password,u.nt_hash,u.pwdlastset"
+        r = do_query(args,query)
+        resp = json.loads(r.text)['results'][0]['data']
+        bh_rows = [[e['row'][0], e['row'][1], e['row'][2], e['row'][3]] for e in resp]
+    else:
+        client = _build_bhce_client(args)
+        bh_rows = []
+        for u in client.list_users():
+            p = u.get('properties') or {}
+            if p.get('cracked'):
+                bh_rows.append([p.get('ntds_uname') or p.get('name'), p.get('password'), p.get('nt_hash'), p.get('pwdlastset')])
+    num_pass_hashes = len(bh_rows)
     num_pass_hashes_list = []
-    for entry in resp:
+    for entry in bh_rows:
         length = ''
-        if entry['row'][1] != None:
-            length = len(entry['row'][1])
+        if entry[1] != None:
+            length = len(entry[1])
         try:
-            num_pass_hashes_list.append([entry['row'][0], entry['row'][1], length, entry['row'][2], datetime.datetime.fromtimestamp(entry['row'][3])], )
+            num_pass_hashes_list.append([entry[0], entry[1], length, entry[2], datetime.datetime.fromtimestamp(entry[3])], )
         except:
-            num_pass_hashes_list.append([entry['row'][0], entry['row'][1], length, entry['row'][2], ''], )
+            num_pass_hashes_list.append([entry[0], entry[1], length, entry[2], ''], )
     num_pass_hashes_list = sorted(num_pass_hashes_list, key = lambda x: -1 if x[1] is None else len(x[1]), reverse=True)
 
     # unique password hashes
-    query = "MATCH (u:User) RETURN COUNT(DISTINCT(u.nt_hash))"
-    r = do_query(args,query)
-    resp = json.loads(r.text)['results'][0]['data']
-    num_uniq_hash = resp[0]['row'][0]
+    if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
+        query = "MATCH (u:User) RETURN COUNT(DISTINCT(u.nt_hash))"
+        r = do_query(args,query)
+        resp = json.loads(r.text)['results'][0]['data']
+        num_uniq_hash = resp[0]['row'][0]
+    else:
+        num_uniq_hash = len(hashes)
 
     # passwords cracked, uniques
-    query = "MATCH (u:User {cracked:True}) RETURN COUNT(DISTINCT(u)),COUNT(DISTINCT(u.password))"
-    r = do_query(args,query)
-    resp = json.loads(r.text)['results'][0]['data']
-    num_cracked = resp[0]['row'][0]
-    num_uniq_cracked = resp[0]['row'][1]
+    if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
+        query = "MATCH (u:User {cracked:True}) RETURN COUNT(DISTINCT(u)),COUNT(DISTINCT(u.password))"
+        r = do_query(args,query)
+        resp = json.loads(r.text)['results'][0]['data']
+        num_cracked = resp[0]['row'][0]
+        num_uniq_cracked = resp[0]['row'][1]
+    else:
+        num_cracked = len(bh_rows)
+        num_uniq_cracked = len(set([r[1] for r in bh_rows if r[1]]))
 
     # password percentages
     if (num_pass_hashes > 0):
@@ -1168,55 +1325,105 @@ def dpat_func(args):
         perc_uniq_cracked = 00.00
 
     # lm hash stats
-    query = "MATCH (u:User) WHERE u.lm_hash IS NOT NULL AND NOT u.lm_hash='aad3b435b51404eeaad3b435b51404ee' RETURN u.lm_hash,count(u.lm_hash)"
-    r = do_query(args,query)
-    resp = json.loads(r.text)['results'][0]['data']
     lm_hash_counts = {}
-    for entry in resp:
-        lm_hash_counts[entry['row'][0]] = entry['row'][1]
+    if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
+        query = "MATCH (u:User) WHERE u.lm_hash IS NOT NULL AND NOT u.lm_hash='aad3b435b51404eeaad3b435b51404ee' RETURN u.lm_hash,count(u.lm_hash)"
+        r = do_query(args,query)
+        resp = json.loads(r.text)['results'][0]['data']
+        for entry in resp:
+            lm_hash_counts[entry['row'][0]] = entry['row'][1]
+    else:
+        client = _build_bhce_client(args)
+        for u in client.list_users():
+            p = u.get('properties') or {}
+            lm = p.get('lm_hash')
+            if lm and lm != 'aad3b435b51404eeaad3b435b51404ee':
+                lm_hash_counts[lm] = lm_hash_counts.get(lm, 0) + 1
     non_blank_lm = sum(lm_hash_counts.values())
     uniq_lm = len(lm_hash_counts)
 
     # lm hash users
-    query = "MATCH (u:User) WHERE u.lm_hash IS NOT NULL AND NOT u.lm_hash='aad3b435b51404eeaad3b435b51404ee' RETURN u.name,u.lm_hash"
-    r = do_query(args,query)
-    resp = json.loads(r.text)['results'][0]['data']
-
     lm_hash_list = []
-    for entry in resp:
-        user = [entry['row'][0], dpat_sanitize(args, entry['row'][1])]
-        user.append(lm_hash_counts[entry['row'][1]])
-        lm_hash_list.append(user)
+    if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
+        query = "MATCH (u:User) WHERE u.lm_hash IS NOT NULL AND NOT u.lm_hash='aad3b435b51404eeaad3b435b51404ee' RETURN u.name,u.lm_hash"
+        r = do_query(args,query)
+        resp = json.loads(r.text)['results'][0]['data']
+        for entry in resp:
+            user = [entry['row'][0], dpat_sanitize(args, entry['row'][1])]
+            user.append(lm_hash_counts[entry['row'][1]])
+            lm_hash_list.append(user)
+    else:
+        client = _build_bhce_client(args)
+        for u in client.list_users():
+            p = u.get('properties') or {}
+            lm = p.get('lm_hash')
+            if lm and lm != 'aad3b435b51404eeaad3b435b51404ee':
+                name = p.get('name') or u.get('name') or ''
+                lm_hash_list.append([name, dpat_sanitize(args, lm), lm_hash_counts.get(lm, 1)])
     lm_hash_list = sorted(lm_hash_list, key = lambda x: x[2], reverse=True)
 
     # matching username/password
-    query = "MATCH (u:User {cracked:true}) WHERE toUpper(SPLIT(u.name,'@')[0])=toUpper(u.password) RETURN u.ntds_uname,u.password,u.nt_hash"
-    r = do_query(args,query)
-    resp = json.loads(r.text)['results'][0]['data']
     user_pass_match_list = []
-    for entry in resp:
-        user_pass_match_list.append([entry['row'][0],dpat_sanitize(args,entry['row'][1]),len(entry['row'][1]),entry['row'][2]])
+    if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
+        query = "MATCH (u:User {cracked:true}) WHERE toUpper(SPLIT(u.name,'@')[0])=toUpper(u.password) RETURN u.ntds_uname,u.password,u.nt_hash"
+        r = do_query(args,query)
+        resp = json.loads(r.text)['results'][0]['data']
+        for entry in resp:
+            user_pass_match_list.append([entry['row'][0],dpat_sanitize(args,entry['row'][1]),len(entry['row'][1]),entry['row'][2]])
+    else:
+        client = _build_bhce_client(args)
+        for u in client.list_users():
+            p = u.get('properties') or {}
+            if p.get('cracked') and p.get('password') and p.get('name'):
+                simple = (p.get('name') or '').split('@')[0]
+                if simple.upper() == str(p.get('password')).upper():
+                    user_pass_match_list.append([p.get('ntds_uname') or p.get('name'), dpat_sanitize(args,p.get('password')), len(p.get('password')), p.get('nt_hash')])
     user_pass_match = len(user_pass_match_list)
 
     # Get Password Length Stats
-    query = "MATCH (u:User {cracked:true}) WHERE NOT u.password='' RETURN  COUNT(SIZE(u.password)), SIZE(u.password) AS sz ORDER BY sz DESC"
-    r = do_query(args,query)
-    resp = json.loads(r.text)['results'][0]['data']
     password_lengths = []
-    for entry in resp:
-        password_lengths.append(entry['row'])
+    if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
+        query = "MATCH (u:User {cracked:true}) WHERE NOT u.password='' RETURN  COUNT(SIZE(u.password)), SIZE(u.password) AS sz ORDER BY sz DESC"
+        r = do_query(args,query)
+        resp = json.loads(r.text)['results'][0]['data']
+        for entry in resp:
+            password_lengths.append(entry['row'])
+    else:
+        client = _build_bhce_client(args)
+        lengths = {}
+        for u in client.list_users():
+            p = u.get('properties') or {}
+            pwd = p.get('password')
+            if p.get('cracked') and pwd:
+                l = len(pwd)
+                lengths[l] = lengths.get(l, 0) + 1
+        for l, c in sorted(lengths.items(), key=lambda x: x[0], reverse=True):
+            password_lengths.append([c, l])
 
     # Get Password (Complexity) Stats
     # sort from most reused to least reused dict to list of tuples
     # get the first instance of not repeated password to be min'd later
-    query = "MATCH (u:User {cracked:true}) WHERE NOT u.password='' RETURN COUNT(u.password) AS countpwd, u.password ORDER BY countpwd DESC"
-    r = do_query(args,query)
-    resp = json.loads(r.text)['results'][0]['data']
     repeated_passwords = []
-    tot_num_repeated_passwords = len(resp)
-    for entry in resp:
-        if entry['row'][0] > 1:
-            repeated_passwords.append(entry['row'])
+    if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
+        query = "MATCH (u:User {cracked:true}) WHERE NOT u.password='' RETURN COUNT(u.password) AS countpwd, u.password ORDER BY countpwd DESC"
+        r = do_query(args,query)
+        resp = json.loads(r.text)['results'][0]['data']
+        tot_num_repeated_passwords = len(resp)
+        for entry in resp:
+            if entry['row'][0] > 1:
+                repeated_passwords.append(entry['row'])
+    else:
+        client = _build_bhce_client(args)
+        counts = {}
+        for u in client.list_users():
+            p = u.get('properties') or {}
+            pwd = p.get('password')
+            if p.get('cracked') and pwd:
+                counts[pwd] = counts.get(pwd, 0) + 1
+        for pwd, cnt in sorted(counts.items(), key=lambda x: x[1], reverse=True):
+            if cnt > 1:
+                repeated_passwords.append([cnt, pwd])
+        tot_num_repeated_passwords = len(repeated_passwords)
     num_repeated_passwords = len(repeated_passwords)
 
     # Passwords not meeting Complexity Requirement
@@ -1228,15 +1435,24 @@ def dpat_func(args):
         lambda s: any(x in special_chars for x in s)
     ]
 
-    query = "MATCH (u:User {cracked:true}) WHERE NOT u.password='' RETURN u.password,u.ntds_uname"
-    r = do_query(args,query)
-    resp = json.loads(r.text)['results'][0]['data']
     password_complexity = []
-    for entry in resp:
-        if sum(rule(entry['row'][0]) for rule in rules) >= 3:
-            password_complexity.append([entry['row'][1],entry['row'][0],True])
-        else:
-            password_complexity.append([entry['row'][1],entry['row'][0],False])
+    if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
+        query = "MATCH (u:User {cracked:true}) WHERE NOT u.password='' RETURN u.password,u.ntds_uname"
+        r = do_query(args,query)
+        resp = json.loads(r.text)['results'][0]['data']
+        for entry in resp:
+            if sum(rule(entry['row'][0]) for rule in rules) >= 3:
+                password_complexity.append([entry['row'][1],entry['row'][0],True])
+            else:
+                password_complexity.append([entry['row'][1],entry['row'][0],False])
+    else:
+        client = _build_bhce_client(args)
+        for u in client.list_users():
+            p = u.get('properties') or {}
+            pwd = p.get('password')
+            if p.get('cracked') and pwd:
+                meets = sum(rule(pwd) for rule in rules) >= 3
+                password_complexity.append([p.get('ntds_uname') or p.get('name'), pwd, meets])
     password_complexity = sorted(password_complexity, key = lambda x: x[2])
 
     # all stats
@@ -1254,26 +1470,49 @@ def dpat_func(args):
         [len(repeated_passwords), "Password Reuse Stats", ['Count', 'Password'], repeated_passwords],
     ]
 
-    if not args.less:
+    if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J and not args.less:
         stats.append([len(group_data), "Groups Cracked by Percentage",  ["Group Name", "Percent Cracked", "Cracked Users", "Total Users"], group_data])
 
     # set all users with cracked passwords as owned
     if args.own_cracked:
         print("[+] Marking cracked users as owned")
-        own_cracked_query="MATCH (u:User {cracked:True}) SET u.owned=true"
-        do_query(args,own_cracked_query)
+        if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
+            own_cracked_query = "MATCH (u:User {cracked:true}) SET u.owned=true"
+            do_query(args, own_cracked_query)
+        else:
+            client = _build_bhce_client(args)
+            for u in client.list_users():
+                p = u.get('properties') or {}
+                if p.get('cracked'):
+                    client.update_user_properties(u, {"owned": True})
     
     # Add a note to users with cracked passwords indicating that they have been cracked
     if args.add_crack_note:
         print('[+] Adding notes to cracked users')
-        add_crack_note_query="MATCH (u:User {cracked=True} SET u.notes=\"Password Cracked\""
-        do_query(args,add_crack_note_query)
+        if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
+            add_crack_note_query = "MATCH (u:User {cracked:true}) SET u.notes='Password Cracked'"
+            do_query(args, add_crack_note_query)
+        else:
+            client = _build_bhce_client(args)
+            for u in client.list_users():
+                p = u.get('properties') or {}
+                if p.get('cracked'):
+                    # append or set a simple note property
+                    note = 'Password Cracked'
+                    existing = p.get('notes')
+                    new_note = note if not existing else f"{existing}; {note}"
+                    client.update_user_properties(u, {"notes": new_note})
 
     # clear the "cracked" tag
     if not args.store and not args.noparse:
         print("[+] Purging information from the database")
-        clear_query = "MATCH (u:User) REMOVE u.cracked REMOVE u.nt_hash REMOVE u.lm_hash REMOVE u.ntds_uname REMOVE u.password"
-        do_query(args,clear_query)
+        if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
+            clear_query = "MATCH (u:User) REMOVE u.cracked REMOVE u.nt_hash REMOVE u.lm_hash REMOVE u.ntds_uname REMOVE u.password"
+            do_query(args, clear_query)
+        else:
+            client = _build_bhce_client(args)
+            for u in client.list_users():
+                client.update_user_properties(u, {"cracked": None, "nt_hash": None, "lm_hash": None, "ntds_uname": None, "password": None})
 
     ###
     ### Output methods
@@ -1457,8 +1696,8 @@ def dpat_func(args):
         print("|{:^10}|{:^85}|".format("Count", "Description"))
         print(" " + "="*96)
 
-        for set in stats:
-             print("|{:^10}|{:^85}|".format(set[0], set[1]))
+        for stat_row in stats:
+            print("|{:^10}|{:^85}|".format(stat_row[0], stat_row[1]))
 
         for item in query_output_data:
             print("|{:^10}|{:^85}|".format(len(item['enabled']) + len(item['disabled']),item['label']))
@@ -1532,10 +1771,19 @@ def main():
 
     general = parser.add_argument_group("Optional Arguments")
 
-    # generic function parameters
+    # backend selection and connection parameters
+    general.add_argument("--backend", dest="backend", choices=[BACKEND_NEO4J, BACKEND_BHCE], default=BACKEND_NEO4J, help="Select backend: 'neo4j' (legacy) or 'bhce' (community edition, preview)")
+    # Neo4j params (legacy)
     general.add_argument("-u",dest="username",default=global_username,help="Neo4j database username (Default: {})".format(global_username))
     general.add_argument("-p",dest="password",default=global_password,help="Neo4j database password (Default: {})".format(global_password))
     general.add_argument("--url",dest="url",default=global_url,help="Neo4j database URL (Default: {})".format(global_url))
+    # BloodHound CE params (preview)
+    general.add_argument("--bhce-url", dest="bhce_url", default=bhce_url_default, help="BloodHound CE base URL (Default: {})".format(bhce_url_default))
+    general.add_argument("--bhce-user", dest="bhce_user", default=bhce_user_default, help="BloodHound CE username (env BHCE_USER)")
+    general.add_argument("--bhce-secret", dest="bhce_secret", default=bhce_secret_default, help="BloodHound CE password/secret (env BHCE_SECRET)")
+    general.add_argument("--bhce-otp", dest="bhce_otp", default=bhce_otp_default, help="Optional one-time passcode for BHCE login (env BHCE_OTP)")
+    general.add_argument("--bhce-cookie", dest="bhce_cookie", default=bhce_cookie_default, help="Optional raw Cookie header to inject (env BHCE_COOKIE)")
+    general.add_argument("--bhce-insecure", dest="bhce_insecure", action="store_true", default=bhce_insecure_default, help="Disable TLS verification for BHCE (env BHCE_INSECURE)")
 
     # three options for the function
     parser._positionals.title = "Available Modules"
@@ -1651,17 +1899,29 @@ def main():
 
 
     if not do_test(args):
-        print("Connection error: restart Neo4j console or verify the the following URL is available: {}".format(args.url))
+        if args.backend == BACKEND_NEO4J:
+            print("Connection error: restart Neo4j console or verify the the following URL is available: {}".format(args.url))
+        else:
+            print("Connection error: verify BloodHound CE is reachable at {} (and token if required).".format(args.bhce_url))
         exit()
 
     if args.command == None:
         print("Error: use a module or use -h/--help to see help")
         return
 
-    if args.username == "":
-        args.username = input("Neo4j Username: ")
-    if args.password == "":
-        args.password = getpass.getpass(prompt="Neo4j Password: ")
+    # Prompt for Neo4j creds only when using the legacy backend
+    if args.backend == BACKEND_NEO4J:
+        if args.username == "":
+            args.username = input("Neo4j Username: ")
+        if args.password == "":
+            args.password = getpass.getpass(prompt="Neo4j Password: ")
+
+    # Temporary: gate modules not yet implemented for BHCE
+    unsupported_bhce = {"query", "export", "del-edge", "add-spns", "add-spw", "get-info"}
+    if args.backend == BACKEND_BHCE and args.command in unsupported_bhce:
+        print("This module uses Neo4j/Cypher in the current version and isn’t implemented for BloodHound CE yet on this branch.")
+        print("Tip: run with --backend neo4j for legacy, or watch this branch for CE support.")
+        return
 
     if args.command == "get-info":
         get_info(args)
