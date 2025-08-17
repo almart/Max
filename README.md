@@ -31,40 +31,40 @@ Ideally there shouldn't be much to install, but I've included a requirements.txt
 
 `pip3 install -r requirements.txt`
 
-### Backend Selection and Credentials
+### Backend selection and credentials
 
-Max currently targets BloodHound Legacy (Neo4j). A preview flag has been added to begin wiring support for BloodHound Community Edition (BHCE):
+Max supports two backends:
 
-- Use legacy (default): add no flag or `--backend neo4j`
-- Select BHCE preview: `--backend bhce` plus `--bhce-url` and `--bhce-token` as needed
+- Legacy Neo4j (default): no flag or `--backend neo4j`
+- BloodHound CE (preview): `--backend bhce` plus BHCE flags
 
-Note: On this branch, most modules still require Neo4j/Cypher. Running them with `--backend bhce` will print a friendly message until CE support is implemented.
+BHCE flags and env vars:
 
-### Neo4j Creds
+- `--bhce-url` (env BHCE_URL)
+- `--bhce-user` (env BHCE_USER)
+- `--bhce-secret` (env BHCE_SECRET)
+
+
+Current BHCE support on this branch:
+
+- Supported: dpat, mark-owned, mark-hvt
+- Legacy-only (use `--backend neo4j`): get-info, query, export, del-edge, add-spns, add-spw
+
+### Neo4j creds
 
 Neo4j credentials can be hardcoded at the beginning of the script, they can be provided as CLI arguments, or stored as environment variables. If either parameter  is left blank, you will be prompted for the uname/password. To use environment variables, it is probably easiest to add a line (e.g., `export NEO4J_USERNAME='neo4j'`) within *~/.bashrc* or *~/.zshrc*  to store the username since it isn't really sensitive. The database password can be set within your shell's tab prior to running Max. Adding a space before the export command should prevent it from appearing within history.
 
 ```bash
  export NEO4J_PASSWORD='bloodhound' # Notice whitespace before 'export'
 python3 max.py {module} {args}
-
 ```
 
-```
-
-For BHCE (preview), you can also set:
+For BHCE (preview), you can set env vars as well:
 
 ```bash
 export BHCE_URL='http://127.0.0.1:8080'
-export BHCE_TOKEN='your_api_token'
-```
-python3 max.py -u neo4j -p neo4j {module} {args}
-```
-
-```
-python3 max.py {module} {args}
-Neo4j Username: neo4j
-Neo4j Password:
+export BHCE_USER='user@example.com'
+export BHCE_SECRET='your_password'
 ```
 
 ### Quick Use
@@ -76,9 +76,15 @@ python3 max.py {module} -h
 ```
 
 Importing owned objects into BH
-```
+```bash
+# Legacy
 python3 max.py mark-owned -f owned.txt
 python3 max.py mark-owned -f owned.txt --add-note "Owned by repeated local admin"
+
+# BHCE
+python3 max.py --backend bhce --bhce-url http://127.0.0.1:8080 \
+	--bhce-user user@example.com --bhce-secret 'pass' \
+	mark-owned -f owned.txt --add-note "Owned by repeated local admin"
 ```
 
 Get list of users
@@ -123,8 +129,15 @@ python3 max.py add-spns -i getuserspns-raw-output.txt
 ```
 
 DPAT
-```
-python3 max.py dpat -n ~/client/ntds.dit -c ~/.hashcat/hashcat.potfile -o ouputdir --html --sanitize
+```bash
+# Legacy
+python3 max.py dpat -n ~/client/ntds.txt -c ~/.hashcat/hashcat.potfile -o outputdir --html --sanitize
+
+# BHCE (recommended to add --less for large graphs)
+python3 max.py --backend bhce --bhce-url http://127.0.0.1:8080 \
+	--bhce-user user@example.com --bhce-secret 'pass' \
+	dpat -n ./samples/ntds_sample.txt -c ./samples/potfile_sample.txt \
+	-S --less --own-cracked --add-crack-note -o ./dpat_report --html
 ```
 
 Pet max
