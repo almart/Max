@@ -176,6 +176,10 @@ cython_debug/
 .pypirc
 
 
+# DPAT generated reports
+dpat_report*/
+
+
 
 # https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
 .vscode/*

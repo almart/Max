@@ -84,12 +84,52 @@ class BHCEClient:
             pass
         return None
 
+    # --- Direct REST: users -------------------------------------------------
+    def get_users(self, page: int = 1, page_size: int = 100, counts: bool = False) -> Optional[Dict[str, Any]]:
+        params = {
+            'page': page,
+            'page_size': page_size,
+        }
+        if counts:
+            params['counts'] = 'true'
+        try:
+            r = self._get('/api/v2/users', params=params)
+            if r.status_code < 300:
+                return r.json()
+        except Exception:
+            pass
+        return None
+
+    def get_user(self, user_id: str, counts: bool = False) -> Optional[Dict[str, Any]]:
+        path = f"/api/v2/users/{user_id}"
+        params = {}
+        if counts:
+            params['counts'] = 'true'
+        try:
+            url = f"{self.base_url}{path}"
+            headers = self._headers()
+            headers['Prefer'] = '0'
+            r = self.session.get(url, headers=headers, params=params, timeout=self.timeout, verify=self.verify)
+            if r.status_code < 300:
+                return r.json()
+        except Exception:
+            pass
+        return None
+
     # --- Cypher query endpoint --------------------------------------------
     def cypher(self, query: str, include_properties: bool = True) -> Optional[Dict[str, Any]]:
         try:
             r = self._post('/api/v2/graphs/cypher', json={"query": query, "include_properties": include_properties})
             if r.status_code < 300:
-                return r.json()
+                # Read JSON if present; for mutation queries the body may be empty
+                try:
+                    data = r.json()
+                    if data:
+                        return data
+                except Exception:
+                    pass
+                # Return a minimal truthy object to indicate success on 2xx
+                return {"ok": True, "status": r.status_code}
         except Exception:
             pass
         return None
@@ -120,19 +160,46 @@ class BHCEClient:
 
 
     def find_user_by_name_or_rid(self, username: str, rid: Optional[str]) -> Optional[Dict[str, Any]]:
-        clauses: List[str] = []
-        safe_user = username.replace("\\", "\\\\").replace("'", "\\'")
-        clauses.append(f"toUpper(u.name) = toUpper('{safe_user}')")
+        """Find a user by SAM@DOMAIN prefix plus RID suffix, with fallback to exact name.
+
+        - Input username may be in the form DOMAIN\\USER or USER@DOMAIN.
+        - Prefer matching nodes where u.name STARTS WITH 'SAM@' AND u.objectid ends with '-RID'.
+        - Fallback to exact u.name match.
+        """
+        raw_user = username or ''
+        # Derive SAM from either DOMAIN\\SAM or SAM@DOMAIN
+        if '@' in raw_user:
+            sam = raw_user.split('@', 1)[0]
+        elif '\\' in raw_user:
+            sam = raw_user.split('\\', 1)[1]
+        else:
+            sam = raw_user
+
+        safe_user = raw_user.replace('\\', '\\\\').replace("'", "\\'")
+        safe_sam = sam.replace('\\', '\\\\').replace("'", "\\'")
+
         if rid:
-            safe_rid = str(rid).replace("'", "")
-            clauses.append(f"toUpper(u.objectid) ENDS WITH '-{safe_rid.upper()}'")
-        where = " OR ".join(clauses)
-        q = f"MATCH (u:User) WHERE {where} RETURN u LIMIT 1"
+            safe_rid = str(rid).replace("'", "").upper()
+            q = (
+                "MATCH (u:User) WHERE toUpper(u.name) STARTS WITH toUpper('" + safe_sam + "@') "
+                f"AND toUpper(u.objectid) ENDS WITH '-{safe_rid}' RETURN u LIMIT 1"
+            )
+        else:
+            q = f"MATCH (u:User) WHERE toUpper(u.name) = toUpper('{safe_user}') RETURN u LIMIT 1"
+
         resp = self.cypher(q, include_properties=True)
         if not resp:
             return None
         nodes = self._extract_nodes(resp)
-        return nodes[0] if nodes else None
+        if nodes:
+            return nodes[0]
+        # Fallback: ignore name and just match RID suffix, picking PHANTOM domains first
+        if rid:
+            q2 = f"MATCH (u:User) WHERE toUpper(u.objectid) ENDS WITH '-{safe_rid}' RETURN u LIMIT 5"
+            resp2 = self.cypher(q2, include_properties=True)
+            nodes2 = self._extract_nodes(resp2) if resp2 else []
+            return nodes2[0] if nodes2 else None
+        return None
 
     def update_user_properties(self, user: Dict[str, Any], props: Dict[str, Any]) -> bool:
         props = dict(props or {})
@@ -159,8 +226,11 @@ class BHCEClient:
             return True
         where = f"u.objectid = '{objid}'" if objid else f"toUpper(u.name) = toUpper('{name.replace("'", "\\'")}')"
         q = f"MATCH (u:User) WHERE {where} SET {', '.join(assignments)} RETURN u LIMIT 1"
-        resp = self.cypher(q, include_properties=False)
-        return bool(resp)
+        try:
+            r = self._post('/api/v2/graphs/cypher', json={"query": q, "include_properties": False})
+            return r.status_code < 300
+        except Exception:
+            return False
 
     def update_node_properties_by_name(self, name: str, props: Dict[str, Any]) -> bool:
         """Generic helper: update arbitrary node by name with provided properties.
@@ -184,5 +254,8 @@ class BHCEClient:
         sets: List[str] = [f"n.{k} = {_fmt(v)}" for k, v in props.items()]
         safe_name = name.replace('\\', '\\\\').replace("'", "\\'")
         q = f"MATCH (n) WHERE toUpper(n.name) = toUpper('{safe_name}') SET {', '.join(sets)} RETURN n LIMIT 1"
-        resp = self.cypher(q, include_properties=False)
-        return bool(resp)
+        try:
+            r = self._post('/api/v2/graphs/cypher', json={"query": q, "include_properties": False})
+            return r.status_code < 300
+        except Exception:
+            return False

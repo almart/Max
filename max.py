@@ -794,25 +794,29 @@ def dpat_sanitize(args, pass_or_hash):
 
 def dpat_parse_ntds(lines, ntds_parsed):
     for line in lines:
-        if ":::" not in line or '$' in line: #filters out other lines in ntds/computer obj
+        # Skip obvious non-user lines and computer accounts
+        if '$' in line:
             continue
         line = line.replace("\r", "").replace("\n", "")
-        if (line == ""):
+        if not line:
             continue
-        else:
-            line = line.split(":")
-        # [ username, domain, rid, LM, NT, plaintext||None]
+        parts = line.split(":")
+        # Expect at least: NAME, RID, LM, NT
+        if len(parts) < 4:
+            continue
+        # [ username, domain, rid, LM, NT ]
         to_append = []
-        if (line[0].split("\\")[0] == line[0]):
+        name_field = parts[0]
+        if (name_field.split("\\")[0] == name_field):
             # no domain found, local account
-            to_append.append(line[0])
+            to_append.append(name_field)
             to_append.append("")
         else:
-            to_append.append(line[0].split("\\")[1])
-            to_append.append(line[0].split("\\")[0])
-        to_append.append(line[1])
-        to_append.append(line[2])
-        to_append.append(line[3])
+            to_append.append(name_field.split("\\")[1])
+            to_append.append(name_field.split("\\")[0])
+        to_append.append(parts[1])
+        to_append.append(parts[2])
+        to_append.append(parts[3])
         ntds_parsed.append(to_append)
 
 
@@ -830,12 +834,12 @@ def dpat_map_users(args, users, potfile):
             cracked_bool = 'false'
             password = None
             password_query = ''
-            if nt_hash in potfile:
+            if nt_hash and nt_hash.lower() in potfile:
                 cracked_bool = 'true'
-                password = potfile[nt_hash]
-            elif lm_hash != "aad3b435b51404eeaad3b435b51404ee" and lm_hash in potfile:
+                password = potfile[nt_hash.lower()]
+            elif lm_hash and lm_hash.lower() != "aad3b435b51404eeaad3b435b51404ee" and lm_hash.lower() in potfile:
                 cracked_bool = 'true'
-                password = potfile[lm_hash]
+                password = potfile[lm_hash.lower()]
 
             if password != None:
                 if "$HEX[" in password:
@@ -934,53 +938,70 @@ def dpat_func(args):
             # done parsing
 
             print("[+] Processing Potfile")
-            # password stats like counting reused cracked passwords
-
+            # Build a map of hash -> plaintext; handle colons in plaintext and $HEX[...] values
             potfile = {}
             with open(args.crackfile,'r') as pot:
-                for line in pot.readlines():
+                for raw in pot.readlines():
                     try:
-                        line = line.strip().replace("$NT$", "").replace("$LM$", "")
-                        if (line == ""):
+                        line = raw.strip()
+                        if not line or line.startswith('#'):
                             continue
-                        line = line.split(":")
+                        # Normalize known prefixes from JTR style
+                        line = line.replace("$NT$", "").replace("$LM$", "")
 
-                        if len(line[0]) != 32:
+                        # Split only on the first colon to preserve colons in plaintext
+                        if ':' not in line:
+                            continue
+                        hash_part, plain_part = line.split(":", 1)
+
+                        # Expect 32-hex NT/LM hash on the left
+                        if len(hash_part) != 32:
                             continue
 
-                        potfile[line[0]] = line[1]
+                        # Decode $HEX[...] plaintext if present
+                        plaintext = plain_part
+                        if plaintext.startswith("$HEX[") and plaintext.endswith("]"):
+                            hex_payload = plaintext[5:-1]
+                            try:
+                                decoded = binascii.unhexlify(hex_payload)
+                                try:
+                                    plaintext = decoded.decode('utf-8')
+                                except Exception:
+                                    plaintext = decoded.decode('latin-1', errors='replace')
+                            except Exception:
+                                # Keep original if decoding fails
+                                pass
 
-                    except:
+                        # normalize to lowercase for case-insensitive matching
+                        potfile[hash_part.lower()] = plaintext
+                    except Exception:
+                        # Be tolerant of malformed lines
                         pass
 
             print('[+] Mapping NTDS users to BloodHound data')
 
             num_lines = len(ntds_parsed)
 
-            # create threads to parse file
-            procs = []
-            num_threads = int(args.num_threads)
-            for t in range(0, num_threads):
-                start = math.ceil((num_lines / num_threads) * t)
-                end = math.ceil((num_lines / num_threads) * (t + 1))
-                p = multiprocessing.Process(target=dpat_map_users, args=(args, ntds_parsed[ start : end ], potfile, ))
-                p.start()
-                procs.append(p)
-            for p_ in procs:
-                p_.join()
-
-
             if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
+                # create threads to parse file
+                procs = []
+                num_threads = int(args.num_threads)
+                for t in range(0, num_threads):
+                    start = math.ceil((num_lines / num_threads) * t)
+                    end = math.ceil((num_lines / num_threads) * (t + 1))
+                    p = multiprocessing.Process(target=dpat_map_users, args=(args, ntds_parsed[ start : end ], potfile, ))
+                    p.start()
+                    procs.append(p)
+                for p_ in procs:
+                    p_.join()
                 count_query = "MATCH (u:User) WHERE u.cracked IS NOT NULL RETURN COUNT(u.name)"
                 r = do_query(args,count_query)
                 resp = json.loads(r.text)['results'][0]['data']
                 count = resp[0]['row'][0]
             else:
-                client = _build_bhce_client(args)
-                count = sum(1 for u in client.list_users() if (u.get('properties') or {}).get('cracked'))
+                # Run single-threaded mapping against BHCE to reuse one session
+                count = dpat_map_users(args, ntds_parsed, potfile)
             print("[+] BloodHound data queried successfully, {} NTDS users mapped to BH data".format(count))
-            if count < 10:
-                print("[-] Warning: Less than 10 users mapped to BloodHound entries, verify the NTDS data matches the Neo4j data, continuing...")
 
         except Exception as e:
             print("[-] Error, {}".format(e))
@@ -1166,9 +1187,74 @@ def dpat_func(args):
             if props.get('nt_hash'):
                 hashes.setdefault(props['nt_hash'], []).append(props.get('ntds_uname') or props.get('name') or '')
     import time
-    # Skip Cypher-only query sections when using BHCE (not yet implemented via API)
     if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_BHCE:
-        print("[*] Skipping BloodHound graph queries for BHCE backend (not implemented via API yet)")
+        # For BHCE, rewrite queries to return nodes and parse from node properties
+        client = _build_bhce_client(args)
+        def _bhce_return_nodes(q: str) -> str:
+            u = q.upper()
+            idx = u.rfind(" RETURN ")
+            if idx != -1:
+                return q[:idx] + " RETURN DISTINCT u"
+            return q.strip() + " RETURN DISTINCT u"
+
+        for search_value in queries:
+            query = search_value['query']
+            label = search_value['label']
+            if (label not in query_counts):
+                query_counts[label] = 0
+            print("[+] Querying for \"" + label + "\"")
+            dat = { 'label' : label }
+            dat['enabled'] = []
+            dat['disabled'] = []
+
+            q_nodes = _bhce_return_nodes(query)
+            resp = client.cypher(q_nodes, include_properties=True)
+            nodes = []
+            if resp:
+                # Extract nodes map -> list
+                data = (resp or {}).get('data') or {}
+                for _, node in (data.get('nodes') or {}).items():
+                    nodes.append(node)
+
+            for node in nodes:
+                props = node.get('properties') or {}
+                query_counts[label] += 1
+                status_flag = 'enabled' if props.get('enabled') else 'disabled'
+                if "cracked" in label.lower():
+                    uname = props.get('ntds_uname') or props.get('name') or ''
+                    pwd = props.get('password')
+                    nth = props.get('nt_hash')
+                    try:
+                        user = [uname, pwd, (0 if pwd is None else len(pwd)), nth]
+                        dat[status_flag].append(user)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        uname = props.get('ntds_uname') or props.get('name') or ''
+                        nth = props.get('nt_hash')
+                        pwd = props.get('password')
+                        shared_list = hashes.get(nth, []) if nth else []
+                        share_count = len(shared_list)
+                        if share_count > 30:
+                            all_hashes_shared = "Shared Hash List > 30"
+                        else:
+                            all_hashes_shared = ', '.join(shared_list)
+                        user = [uname, nth, all_hashes_shared, share_count, pwd]
+                        dat[status_flag].append(user)
+                    except Exception:
+                        pass
+
+            if "cracked" in label.lower():
+                dat['columns'] = ["Username", "Password", "Password Length", "NT Hash"]
+                dat['enabled'] = sorted(dat['enabled'], key = lambda x: -1 if x[1] is None else len(x[1]), reverse=True)
+                dat['disabled'] = sorted(dat['disabled'], key = lambda x: -1 if x[1] is None else len(x[1]), reverse=True)
+            else:
+                dat['columns'] = ["Username", "NT Hash", "Users Sharing this Hash", "Share Count", "Password"]
+                dat['enabled'] = sorted(dat['enabled'], key = lambda x: -1 if x[3] is None else x[3], reverse=True)
+                dat['disabled'] = sorted(dat['disabled'], key = lambda x: -1 if x[3] is None else x[3], reverse=True)
+
+            query_output_data.append(dat)
     else:
         for search_value in queries:
             # start = time.time()
@@ -1226,32 +1312,78 @@ def dpat_func(args):
     ###
     # TODO: Output group members in html output
 
-    if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J and not args.less:
+    if not args.less:
+        if getattr(args, 'backend', BACKEND_NEO4J) == BACKEND_NEO4J:
 
-        print("[+] Querying for Group Statistics")
-        group_query_data = {}
-        group_data = []
+            print("[+] Querying for Group Statistics")
+            group_query_data = {}
+            group_data = []
 
-        query = "MATCH (u:User)-[:MemberOf]->(g:Group) RETURN DISTINCT g.name,u.name,u.cracked"
-        r = do_query(args,query)
-        resp = json.loads(r.text)['results'][0]['data']
-        for entry in resp:
-            group_name = entry['row'][0]
-            username = entry['row'][1]
-            crack_status = entry['row'][2]
+            query = "MATCH (u:User)-[:MemberOf]->(g:Group) RETURN DISTINCT g.name,u.name,u.cracked"
+            r = do_query(args,query)
+            resp = json.loads(r.text)['results'][0]['data']
+            for entry in resp:
+                group_name = entry['row'][0]
+                username = entry['row'][1]
+                crack_status = entry['row'][2]
 
-            if group_name not in group_query_data:
-                group_query_data[group_name] = [[username,crack_status]]
-            else:
-                group_query_data[group_name].append([username,crack_status])
+                if group_name not in group_query_data:
+                    group_query_data[group_name] = [[username,crack_status]]
+                else:
+                    group_query_data[group_name].append([username,crack_status])
 
-        for group_name in group_query_data:
-            cracked_total = sum(user[1] == True for user in group_query_data[group_name])
-            if cracked_total == 0:
-                continue
-            perc = round(100 * float(cracked_total / len(group_query_data[group_name])), 2)
-            group_data.append([group_name,perc,cracked_total,len(group_query_data[group_name])])
-        group_data = sorted(group_data, key = lambda x: x[1], reverse=True)
+            for group_name in group_query_data:
+                cracked_total = sum(user[1] == True for user in group_query_data[group_name])
+                if cracked_total == 0:
+                    continue
+                perc = round(100 * float(cracked_total / len(group_query_data[group_name])), 2)
+                group_data.append([group_name,perc,cracked_total,len(group_query_data[group_name])])
+            group_data = sorted(group_data, key = lambda x: x[1], reverse=True)
+        else:
+            # BHCE: build group statistics by parsing MemberOf edges
+            print("[+] Querying for Group Statistics (BHCE)")
+            client = _build_bhce_client(args)
+            resp = client.cypher("MATCH p=(u:User)-[:MemberOf]->(g:Group) RETURN p", include_properties=True)
+            data = (resp or {}).get('data') or {}
+            nodes = data.get('nodes') or {}
+            edges = data.get('edges') or []
+            # Build id -> node properties
+            node_props = {}
+            for nid, node in nodes.items():
+                props = node.get('properties') or {}
+                props_f = dict(props)
+                props_f['kind'] = node.get('kind')
+                props_f['label'] = node.get('label')
+                node_props[nid] = props_f
+            # Map group name -> list of [username, cracked]
+            group_query_data = {}
+            for e in edges:
+                if e.get('kind') != 'MemberOf':
+                    continue
+                uid = e.get('source')
+                gid = e.get('target')
+                u = node_props.get(uid, {})
+                g = node_props.get(gid, {})
+                if not u or not g:
+                    continue
+                if (u.get('kind') or '').lower() != 'user' or (g.get('kind') or '').lower() != 'group':
+                    # Some graphs may have reversed edges; attempt swap
+                    u, g = g, u
+                    if (u.get('kind') or '').lower() != 'user' or (g.get('kind') or '').lower() != 'group':
+                        continue
+                gname = g.get('name') or g.get('label') or ''
+                uname = u.get('name') or ''
+                cracked = bool(u.get('cracked'))
+                group_query_data.setdefault(gname, []).append([uname, cracked])
+            # Compute stats
+            group_data = []
+            for gname, members in group_query_data.items():
+                cracked_total = sum(1 for _, c in members if c)
+                if cracked_total == 0:
+                    continue
+                perc = round(100 * float(cracked_total / len(members)), 2)
+                group_data.append([gname, perc, cracked_total, len(members)])
+            group_data = sorted(group_data, key=lambda x: x[1], reverse=True)
 
     ###
     ### Get the Overall Stats ready
@@ -1623,6 +1755,15 @@ def dpat_func(args):
 
         print("[+] Writing HTML files")
 
+        # Helper to build safe deterministic filenames for report parts
+        def _fname(label: str) -> str:
+            s = ''.join([c if (c.isalnum() or c in ' _-().') else '_' for c in str(label)])
+            s = s.replace(' ', '_')
+            # collapse duplicate underscores
+            while '__' in s:
+                s = s.replace('__', '_')
+            return f"{s}.html"
+
         # add overall stats
         for stat in stats:
 
@@ -1632,7 +1773,7 @@ def dpat_func(args):
             else:
                 hbt = HtmlBuilder()
                 hbt.add_table_to_html(stat[3], stat[2])
-                filename = hbt.write_html_report(filebase, ''.join([stat[1].replace(' ','_'),".html"]))
+                filename = hbt.write_html_report(filebase, _fname(stat[1]))
                 summary_table.append((stat[0], stat[1],"<a href=\"" + filename + "\">Details</a>"))
 
         # add BH query results
@@ -1651,7 +1792,7 @@ def dpat_func(args):
 
             hbt = HtmlBuilder()
             hbt.add_table_to_html(all_entries, cols)
-            filename = hbt.write_html_report(filebase, ''.join([item['label'].replace(' ','_'),".html"]))
+            filename = hbt.write_html_report(filebase, _fname(item['label']))
             summary_table.append((len(all_entries), item['label'],"<a href=\"" + filename + "\">Details</a>"))
 
         hb.add_table_to_html(summary_table, summary_table_headers, 2)
